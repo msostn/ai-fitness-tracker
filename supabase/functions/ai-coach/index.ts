@@ -17,7 +17,6 @@ Deno.serve(async (req) => {
       throw new Error("Message and userId are required");
     }
 
-    // Get user from auth header
     const authHeader = req.headers.get("Authorization");
     if (!authHeader) {
       throw new Error("Authorization header is required");
@@ -33,7 +32,6 @@ Deno.serve(async (req) => {
       }
     );
 
-    // Fetch user profile and recent data for context
     const { data: profile } = await supabaseClient
       .from("profiles")
       .select("*")
@@ -41,6 +39,7 @@ Deno.serve(async (req) => {
       .single();
 
     const today = new Date().toISOString().split("T")[0];
+
     const { data: todaySummary } = await supabaseClient
       .from("daily_nutrition_summary")
       .select("*")
@@ -48,8 +47,8 @@ Deno.serve(async (req) => {
       .eq("date", today)
       .maybeSingle();
 
-    // Build context for AI
     let context = "User Profile:\n";
+
     if (profile) {
       context += `- Fitness Goal: ${profile.fitness_goal}\n`;
       context += `- Activity Level: ${profile.activity_level}\n`;
@@ -66,50 +65,70 @@ Deno.serve(async (req) => {
       context += `- Fats: ${todaySummary.total_fats_g}g\n`;
     }
 
-    // Call Lovable AI
-    const response = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${Deno.env.get("LOVABLE_API_KEY")}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "google/gemini-2.5-flash",
-        messages: [
-          {
-            role: "system",
-            content: `You are an expert AI fitness and nutrition coach. Provide personalized, actionable advice based on the user's data. Be encouraging, supportive, and specific. Keep responses concise but helpful (2-4 sentences). Use emojis occasionally to be friendly.
+    const systemInstruction = `You are an expert AI fitness and nutrition coach.
 
-${context}`,
+Provide personalized, actionable advice based on the user's data. Be encouraging, supportive, and specific. Keep responses concise but helpful (2-4 sentences). Use emojis occasionally to be friendly.
+
+${context}`;
+
+    const response = await fetch(
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": Deno.env.get("GEMINI_API_KEY") ?? "",
+        },
+        body: JSON.stringify({
+          systemInstruction: {
+            parts: [{ text: systemInstruction }],
           },
-          {
-            role: "user",
-            content: message,
-          },
-        ],
-      }),
-    });
+          contents: [
+            {
+              role: "user",
+              parts: [{ text: message }],
+            },
+          ],
+        }),
+      }
+    );
 
     if (!response.ok) {
       const errorText = await response.text();
-      console.error("AI API error:", errorText);
+      console.error("Gemini API error:", errorText);
       throw new Error("Failed to get AI response");
     }
 
     const aiData = await response.json();
-    const aiResponse = aiData.choices[0].message.content;
+
+    const aiResponse =
+      aiData.candidates?.[0]?.content?.parts?.[0]?.text;
+
+    if (!aiResponse) {
+      console.error("Unexpected Gemini response:", JSON.stringify(aiData));
+      throw new Error("Invalid response from Gemini");
+    }
 
     return new Response(JSON.stringify({ response: aiResponse }), {
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
+      headers: {
+        ...corsHeaders,
+        "Content-Type": "application/json",
+      },
     });
   } catch (error) {
     console.error("Error in ai-coach:", error);
-    const errorMessage = error instanceof Error ? error.message : "An error occurred";
+
+    const errorMessage =
+      error instanceof Error ? error.message : "An error occurred";
+
     return new Response(
       JSON.stringify({ error: errorMessage }),
       {
         status: 500,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
+        headers: {
+          ...corsHeaders,
+          "Content-Type": "application/json",
+        },
       }
     );
   }

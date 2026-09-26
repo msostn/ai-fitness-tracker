@@ -17,13 +17,12 @@ Deno.serve(async (req) => {
       throw new Error("Meal description or image is required");
     }
 
-    // Get user from auth header
     const authHeader = req.headers.get("Authorization");
+
     if (!authHeader) {
       throw new Error("Authorization header is required");
     }
 
-    // Create Supabase client with proper auth handling
     const supabaseClient = createClient(
       Deno.env.get("SUPABASE_URL") ?? "",
       Deno.env.get("SUPABASE_ANON_KEY") ?? "",
@@ -44,99 +43,120 @@ Deno.serve(async (req) => {
       throw new Error("User not authenticated");
     }
 
-    // Call Lovable AI to analyze the meal
-    const messages: any[] = [
-      {
-        role: "system",
-        content: `You are an expert nutritionist and food analyst. Analyze the meal description or image and provide highly accurate nutritional estimates based on standard food databases (USDA, nutritionix).
+    const systemInstruction = `You are an expert nutritionist and food analyst.
+
+Analyze the meal description or image and provide nutritional estimates based on standard food databases and typical serving sizes.
 
 Return ONLY a valid JSON object with this exact structure:
+
 {
-  "calories": number (total kcal),
-  "protein_g": number (grams),
-  "carbs_g": number (grams),
-  "fats_g": number (grams),
+  "calories": number,
+  "protein_g": number,
+  "carbs_g": number,
+  "fats_g": number,
   "meal_type": "breakfast/lunch/dinner/snack"
 }
 
-Critical instructions:
-- Be highly accurate with calorie and macro estimates based on standard portion sizes
-- If quantities/portions are specified (e.g., "2 eggs", "1 cup rice"), use exact measurements
-- If no quantity specified, assume standard serving sizes
-- Break down composite meals into individual components for accuracy
-- For meal_type, intelligently determine from the foods: breakfast (eggs, toast, cereal), lunch (sandwiches, salads), dinner (heavier proteins, full meals), snack (light items)
-- Return ONLY the JSON object, no markdown, no explanations`,
-      },
-    ];
+Rules:
+- Estimate calories and macronutrients using standard portion sizes.
+- If quantities or portions are specified, use those measurements.
+- If no quantity is specified, assume a standard serving size.
+- Break composite meals into individual components when estimating nutrition.
+- Determine the most appropriate meal type.
+- Return ONLY the JSON object. Do not include markdown or explanations.`;
 
-    if (imageBase64) {
-      // If image is provided, use vision model
-      messages.push({
-        role: "user",
-        content: [
-          {
-            type: "text",
-            text: mealDescription ? `Analyze this meal image. Additional context: ${mealDescription}` : "Analyze this meal image and identify all food items visible.",
-          },
-          {
-            type: "image_url",
-            image_url: {
-              url: `data:image/jpeg;base64,${imageBase64}`,
-            },
-          },
-        ],
+    const parts: Array<Record<string, unknown>> = [];
+
+    if (mealDescription) {
+      parts.push({
+        text: imageBase64
+          ? `Analyze this meal image. Additional context: ${mealDescription}`
+          : `Analyze this meal: ${mealDescription}`,
       });
     } else {
-      // Text-only analysis
-      messages.push({
-        role: "user",
-        content: `Analyze this meal: ${mealDescription}`,
+      parts.push({
+        text: "Analyze this meal image and identify all food items visible.",
       });
     }
 
-    const response = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${Deno.env.get("LOVABLE_API_KEY")}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "google/gemini-2.5-flash",
-        messages: messages,
-      }),
-    });
+    if (imageBase64) {
+      parts.push({
+        inline_data: {
+          mime_type: "image/jpeg",
+          data: imageBase64,
+        },
+      });
+    }
+
+    const response = await fetch(
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": Deno.env.get("GEMINI_API_KEY") ?? "",
+        },
+        body: JSON.stringify({
+          systemInstruction: {
+            parts: [{ text: systemInstruction }],
+          },
+          contents: [
+            {
+              role: "user",
+              parts,
+            },
+          ],
+          generationConfig: {
+            responseMimeType: "application/json",
+          },
+        }),
+      }
+    );
 
     if (!response.ok) {
       const errorText = await response.text();
-      console.error("AI API error:", errorText);
+      console.error("Gemini API error:", errorText);
       throw new Error("Failed to analyze meal");
     }
 
     const aiData = await response.json();
-    const aiResponse = aiData.choices[0].message.content;
+
+    const aiResponse =
+      aiData.candidates?.[0]?.content?.parts?.[0]?.text;
+
+    if (!aiResponse) {
+      console.error(
+        "Unexpected Gemini response:",
+        JSON.stringify(aiData)
+      );
+      throw new Error("Invalid response from Gemini");
+    }
 
     let nutritionData;
+
     try {
       nutritionData = JSON.parse(aiResponse);
-    } catch (e) {
+    } catch (error) {
       console.error("Failed to parse AI response:", aiResponse);
       throw new Error("Invalid response from AI");
     }
 
-    // Insert meal into database
-    const { error: mealError } = await supabaseClient.from("meals").insert({
-      user_id: user.id,
-      meal_description: mealDescription,
-      calories: nutritionData.calories,
-      protein_g: nutritionData.protein_g,
-      carbs_g: nutritionData.carbs_g,
-      fats_g: nutritionData.fats_g,
-      meal_type: nutritionData.meal_type,
-    });
+    const { error: mealError } = await supabaseClient
+      .from("meals")
+      .insert({
+        user_id: user.id,
+        meal_description: mealDescription,
+        calories: nutritionData.calories,
+        protein_g: nutritionData.protein_g,
+        carbs_g: nutritionData.carbs_g,
+        fats_g: nutritionData.fats_g,
+        meal_type: nutritionData.meal_type,
+      });
 
-    if (mealError) throw mealError;
+    if (mealError) {
+      throw mealError;
+    }
 
-    // Update or create daily summary
     const today = new Date().toISOString().split("T")[0];
 
     const { data: existingSummary } = await supabaseClient
@@ -150,37 +170,58 @@ Critical instructions:
       await supabaseClient
         .from("daily_nutrition_summary")
         .update({
-          total_calories: existingSummary.total_calories + nutritionData.calories,
-          total_protein_g: existingSummary.total_protein_g + nutritionData.protein_g,
-          total_carbs_g: existingSummary.total_carbs_g + nutritionData.carbs_g,
-          total_fats_g: existingSummary.total_fats_g + nutritionData.fats_g,
+          total_calories:
+            existingSummary.total_calories + nutritionData.calories,
+          total_protein_g:
+            existingSummary.total_protein_g + nutritionData.protein_g,
+          total_carbs_g:
+            existingSummary.total_carbs_g + nutritionData.carbs_g,
+          total_fats_g:
+            existingSummary.total_fats_g + nutritionData.fats_g,
           meals_count: existingSummary.meals_count + 1,
           updated_at: new Date().toISOString(),
         })
         .eq("id", existingSummary.id);
     } else {
-      await supabaseClient.from("daily_nutrition_summary").insert({
-        user_id: user.id,
-        date: today,
-        total_calories: nutritionData.calories,
-        total_protein_g: nutritionData.protein_g,
-        total_carbs_g: nutritionData.carbs_g,
-        total_fats_g: nutritionData.fats_g,
-        meals_count: 1,
-      });
+      await supabaseClient
+        .from("daily_nutrition_summary")
+        .insert({
+          user_id: user.id,
+          date: today,
+          total_calories: nutritionData.calories,
+          total_protein_g: nutritionData.protein_g,
+          total_carbs_g: nutritionData.carbs_g,
+          total_fats_g: nutritionData.fats_g,
+          meals_count: 1,
+        });
     }
 
-    return new Response(JSON.stringify({ success: true, data: nutritionData }), {
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
+    return new Response(
+      JSON.stringify({
+        success: true,
+        data: nutritionData,
+      }),
+      {
+        headers: {
+          ...corsHeaders,
+          "Content-Type": "application/json",
+        },
+      }
+    );
   } catch (error) {
     console.error("Error in analyze-meal:", error);
-    const errorMessage = error instanceof Error ? error.message : "An error occurred";
+
+    const errorMessage =
+      error instanceof Error ? error.message : "An error occurred";
+
     return new Response(
       JSON.stringify({ error: errorMessage }),
       {
         status: 500,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
+        headers: {
+          ...corsHeaders,
+          "Content-Type": "application/json",
+        },
       }
     );
   }
